@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice AI Production Client</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+        .card { background: #1e293b; padding: 2.5rem; border-radius: 1rem; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3); text-align: center; max-width: 400px; width: 100%; }
+        button { background: #3b82f6; color: white; border: none; padding: 0.75rem 1.5rem; font-size: 1rem; font-weight: 600; border-radius: 0.5rem; cursor: pointer; transition: all 0.2s; margin-top: 1.5rem; width: 100%; }
+        button:hover { background: #2563eb; }
+        button.active { background: #ef4444; }
+        button.active:hover { background: #dc2626; }
+        .status { margin-top: 1rem; font-size: 0.875rem; color: #94a3b8; }
+        .indicator { inline-size: 12px; block-size: 12px; border-radius: 50%; display: inline-block; margin-inline-end: 0.5rem; background: #ef4444; }
+        .indicator.online { background: #22c55e; }
+    </style>
+</head>
+<body>
+
+    <div class="card">
+        <h2>Voice AI System</h2>
+        <p>Production-grade realtime audio streaming</p>
+        
+        <div style="display: flex; align-items: center; justify-content: center;">
+            <span id="statusIndicator" class="indicator"></span>
+            <span id="statusText" class="status">Disconnected</span>
+        </div>
+
+        <button id="actionBtn" onclick="toggleSession()">Start Conversation</button>
+    </div>
+
+    <script>
+        let ws = null;
+        let audioContext = null;
+        let scriptProcessor = null;
+        let mediaStreamSource = null;
+        let isContextInitialized = false;
+
+        const SAMPLE_RATE = 24000; // OpenAI exact required input rate
+        const CHUNK_SIZE = 2048;
+
+        function updateStatus(connected, text) {
+            const indicator = document.getElementById("statusIndicator");
+            const statusText = document.getElementById("statusText");
+            const btn = document.getElementById("actionBtn");
+
+            if (connected) {
+                indicator.classList.add("online");
+                statusText.innerText = text || "Connected & Streaming";
+                btn.innerText = "Stop Session";
+                btn.classList.add("active");
+            } else {
+                indicator.classList.remove("online");
+                statusText.innerText = text || "Disconnected";
+                btn.innerText = "Start Conversation";
+                btn.classList.remove("active");
+            }
+        }
+
+        async function initAudio() {
+            if (isContextInitialized) return;
+
+            // Initialize AudioContext locked to 24kHz
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                sampleRate: SAMPLE_RATE
+            });
+            await audioContext.resume();
+            isContextInitialized = true;
+        }
+
+        async function toggleSession() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                stopSession();
+                return;
+            }
+            await startSession();
+        }
+
+        async function startSession() {
+            try {
+                await initAudio();
+                updateStatus(false, "Connecting to gateway...");
+
+                // Connect directly to the FastAPI custom gateway from Lab 5
+                ws = new WebSocket("ws://localhost:8000/v1/voice");
+
+                ws.onopen = async () => {
+                    updateStatus(true);
+                    await startMicrophoneStreaming();
+                };
+
+                ws.onmessage = async (event) => {
+                    handleIncomingGatewayMessage(event.data);
+                };
+
+                ws.onclose = () => {
+                    stopSession();
+                };
+
+                ws.onerror = (err) => {
+                    console.error("WebSocket Error:", err);
+                    stopSession();
+                };
+
+            } catch (err) {
+                console.error("Failed to initialize system:", err);
+                updateStatus(false, "Microphone access denied");
+            }
+        }
+
+        async function startMicrophoneStreaming() {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    channelCount: 1,
+                    sampleRate: SAMPLE_RATE,
+                    echoCancellation: true,
+                    noiseSuppression: true
+                }
+            });
+
+            mediaStreamSource = audioContext.createMediaStreamSource(stream);
+            
+            // Raw buffer downsampler/processor
+            scriptProcessor = audioContext.createScriptProcessor(CHUNK_SIZE, 1, 1);
+            
+            scriptProcessor.onaudioprocess = (audioProcessingEvent) => {
+                if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+                const inputBuffer = audioProcessingEvent.inputBuffer;
+                const inputData = inputBuffer.getChannelData(0); // Float32 samples
+                
+                // Convert Float32 native browser layout to Int16 PCM required by OpenAI
+                const pcm16Buffer = new Int16Array(inputData.length);
+                for (let i = 0; i < inputData.length; i++) {
+                    let s = Math.max(-1, Math.min(1, inputData[i]));
+                    pcm16Buffer[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+
+                // Convert payload directly to base64 encoding string
+                const binary = String.fromCharCode.apply(null, new Uint8Array(pcm16Buffer.buffer));
+                const base64Audio = btoa(binary);
+
+                const audioEvent = {
+                    type: "input_audio_buffer.append",
+                    audio: base64Audio
+                };
+
+                ws.send(JSON.stringify(audioEvent));
+            };
+
+            mediaStreamSource.connect(scriptProcessor);
+            scriptProcessor.connect(audioContext.destination);
+        }
+
+        function handleIncomingGatewayMessage(data) {
+            try {
+                const event = JSON.parse(data);
+
+                // Handle live structural audio deltas coming from backend
+                if (event.type === "response.audio.delta" && event.audio) {
+                    playRawBase64AudioChunk(event.audio);
+                }
+                
+                // Track backend-driven interruptions
+                if (event.type === "input_audio_buffer.speech_started") {
+                    console.log("Speech started: system interrupting ongoing output playback.");
+                    // Flush current audio pipeline loops if necessary
+                }
+            } catch (err) {
+                // Handle raw binary channels or debug frames if passed directly
+            }
+        }
+
+        // Low latency buffer queue builder
+        let nextPlaybackTime = 0;
+        function playRawBase64AudioChunk(base64Audio) {
+            const binaryString = atob(base64Audio);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+
+            // Read the Int16 raw data back to browser-native Float32
+            const int16Array = new Int16Array(bytes.buffer);
+            const float32Array = new Float32Array(int16Array.length);
+            for (let i = 0; i < int16Array.length; i++) {
+                float32Array[i] = int16Array[i] / 32768.0;
+            }
+
+            // Create dynamic output sound buffer frame
+            const audioBuffer = audioContext.createBuffer(1, float32Array.length, SAMPLE_RATE);
+            audioBuffer.getChannelData(0).set(float32Array);
+
+            const bufferSource = audioContext.createBufferSource();
+            bufferSource.buffer = audioBuffer;
+            bufferSource.connect(audioContext.destination);
+
+            // Schedule frames seamlessly one after another to prevent popping audio cracks
+            const currentTime = audioContext.currentTime;
+            if (nextPlaybackTime < currentTime) {
+                nextPlaybackTime = currentTime;
+            }
+            bufferSource.start(nextPlaybackTime);
+            nextPlaybackTime += audioBuffer.duration;
+        }
+
+        function stopSession() {
+            updateStatus(false);
+            
+            if (scriptProcessor) {
+                scriptProcessor.disconnect();
+                scriptProcessor.onaudioprocess = null;
+            }
+            if (mediaStreamSource) {
+                mediaStreamSource.disconnect();
+            }
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            nextPlaybackTime = 0;
+            console.log("Voice infrastructure disconnected safely.");
+        }
+    </script>
+</body>
+</html>
