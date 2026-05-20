@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice AI Client with Live Visualizer</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+        .card { background: #1e293b; padding: 2rem; border-radius: 1rem; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3); text-align: center; max-width: 450px; width: 100%; box-sizing: border-box; }
+        button { background: #3b82f6; color: white; border: none; padding: 0.75rem 1.5rem; font-size: 1rem; font-weight: 600; border-radius: 0.5rem; cursor: pointer; transition: all 0.2s; margin-top: 1.5rem; width: 100%; }
+        button:hover { background: #2563eb; }
+        button.active { background: #ef4444; }
+        button.active:hover { background: #dc2626; }
+        .status { margin-top: 1rem; font-size: 0.875rem; color: #94a3b8; }
+        .indicator { width: 12px; height: 12px; border-radius: 50%; display: inline-block; margin-right: 0.5rem; background: #ef4444; }
+        .indicator.online { background: #22c55e; }
+        
+        /* Visualizer Box Container */
+        .visualizer-container { margin-top: 1.5rem; background: #020617; border-radius: 0.5rem; border: 1px solid #334155; overflow: hidden; height: 120px; position: relative; }
+        canvas { width: 100%; height: 100%; display: block; }
+    </style>
+</head>
+<body>
+
+    <div class="card">
+        <h2>Voice AI System</h2>
+        <p>Production-grade realtime audio streaming</p>
+        
+        <div style="display: flex; align-items: center; justify-content: center;">
+            <span id="statusIndicator" class="indicator"></span>
+            <span id="statusText" class="status">Disconnected</span>
+        </div>
+
+        <!-- HTML5 Canvas Visualizer Element -->
+        <div class="visualizer-container">
+            <canvas id="waveformCanvas"></canvas>
+        </div>
+
+        <button id="actionBtn" onclick="toggleSession()">Start Conversation</button>
+    </div>
+
+    <script>
+        let ws = null;
+        let audioContext = null;
+        let scriptProcessor = null;
+        let mediaStreamSource = null;
+        let isContextInitialized = false;
+        
+        // Nodes required for the Live Visualizer
+        let masterAnalyser = null;
+        let animationFrameId = null;
+
+        const SAMPLE_RATE = 24000; 
+        const CHUNK_SIZE = 2048;
+
+        function updateStatus(connected, text) {
+            const indicator = document.getElementById("statusIndicator");
+            const statusText = document.getElementById("statusText");
+            const btn = document.getElementById("actionBtn");
+
+            if (connected) {
+                indicator.classList.add("online");
+                statusText.innerText = text || "Connected & Streaming";
+                btn.innerText = "Stop Session";
+                btn.classList.add("active");
+            } else {
+                indicator.classList.remove("online");
+                statusText.innerText = text || "Disconnected";
+                btn.innerText = "Start Conversation";
+                btn.classList.remove("active");
+            }
+        }
+
+        async function initAudio() {
+            if (isContextInitialized) return;
+
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                sampleRate: SAMPLE_RATE
+            });
+            await audioContext.resume();
+
+            // Set up a shared routing Analyser Node for rendering the waveform
+            masterAnalyser = audioContext.createAnalyser();
+            masterAnalyser.fftSize = 512; // Fast time-domain resolution
+            masterAnalyser.connect(audioContext.destination);
+
+            isContextInitialized = true;
+        }
+
+        async function toggleSession() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                stopSession();
+                return;
+            }
+            await startSession();
+        }
+
+        async function startSession() {
+            try {
+                await initAudio();
+                updateStatus(false, "Connecting to gateway...");
+
+                ws = new WebSocket("ws://localhost:8000/v1/voice");
+
+                ws.onopen = async () => {
+                    updateStatus(true);
+                    await startMicrophoneStreaming();
+                    startCanvasRenderLoop(); // Run visualizer loop immediately
+                };
+
+                ws.onmessage = async (event) => {
+                    handleIncomingGatewayMessage(event.data);
+                };
+
+                ws.onclose = () => { stopSession(); };
+                ws.onerror = (err) => { console.error(err); stopSession(); };
+
+            } catch (err) {
+                console.error(err);
+                updateStatus(false, "Microphone access denied");
+            }
+        }
+
+        async function startMicrophoneStreaming() {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: { channelCount: 1, sampleRate: SAMPLE_RATE, echoCancellation: true, noiseSuppression: true }
+            });
+
+            mediaStreamSource = audioContext.createMediaStreamSource(stream);
+            scriptProcessor = audioContext.createScriptProcessor(CHUNK_SIZE, 1, 1);
+            
+            scriptProcessor.onaudioprocess = (audioProcessingEvent) => {
+                if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+                const inputData = audioProcessingEvent.inputBuffer.getChannelData(0);
+                const pcm16Buffer = new Int16Array(inputData.length);
+                for (let i = 0; i < inputData.length; i++) {
+                    let s = Math.max(-1, Math.min(1, inputData[i]));
+                    pcm16Buffer[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+
+                const binary = String.fromCharCode.apply(null, new Uint8Array(pcm16Buffer.buffer));
+                ws.send(JSON.stringify({
+                    type: "input_audio_buffer.append",
+                    audio: btoa(binary)
+                }));
+            };
+
+            // Route mic input through the visualizer analyzer
+            mediaStreamSource.connect(scriptProcessor);
+            mediaStreamSource.connect(masterAnalyser); 
+            scriptProcessor.connect(audioContext.destination);
+        }
+
+        function handleIncomingGatewayMessage(data) {
+            try {
+                const event = JSON.parse(data);
+                if (event.type === "response.audio.delta" && event.audio) {
+                    playRawBase64AudioChunk(event.audio);
+                }
+            } catch (err) {}
+        }
+
+        let nextPlaybackTime = 0;
+        function playRawBase64AudioChunk(base64Audio) {
+            const binaryString = atob(base64Audio);
+            const int16Array = new Int16Array(new Uint8Array([...binaryString].map(c => c.charCodeAt(0))).buffer);
+            const float32Array = new Float32Array(int16Array.length);
+            
+            for (let i = 0; i < int16Array.length; i++) {
+                float32Array[i] = int16Array[i] / 32768.0;
+            }
+
+            const audioBuffer = audioContext.createBuffer(1, float32Array.length, SAMPLE_RATE);
+            audioBuffer.getChannelData(0).set(float32Array);
+
+            const bufferSource = audioContext.createBufferSource();
+            bufferSource.buffer = audioBuffer;
+            
+            // Connect downstream AI audio to the visualizer node as well
+            bufferSource.connect(masterAnalyser); 
+
+            const currentTime = audioContext.currentTime;
+            if (nextPlaybackTime < currentTime) {
+                nextPlaybackTime = currentTime;
+            }
+            bufferSource.start(nextPlaybackTime);
+            nextPlaybackTime += audioBuffer.duration;
+        }
+
+        // High Performance Canvas Rendering Engine
+        function startCanvasRenderLoop() {
+            const canvas = document.getElementById("waveformCanvas");
+            const ctx = canvas.getContext("2d");
+            
+            // Sync internal scaling map to prevent blurry retina screens
+            canvas.width = canvas.offsetWidth * window.devicePixelRatio;
+            canvas.height = canvas.offsetHeight * window.devicePixelRatio;
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+
+            const bufferLength = masterAnalyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+
+            function draw() {
+                animationFrameId = requestAnimationFrame(draw);
+                
+                // Fetch current amplitude snapshots
+                masterAnalyser.getByteTimeDomainData(dataArray);
+
+                // Clear frame with a solid night sky color
+                ctx.fillStyle = "#020617";
+                ctx.fillRect(0, 0, canvas.offsetWidth, canvas.offsetHeight);
+
+                // Configure vector lines
+                ctx.lineWidth = 3;
+                ctx.strokeStyle = "#3b82f6"; // Primary Blue Line
+                ctx.beginPath();
+
+                const sliceWidth = canvas.offsetWidth / bufferLength;
+                let x = 0;
+
+                for (let i = 0; i < bufferLength; i++) {
+                    const v = dataArray[i] / 128.0; // Calculate current offset ratio
+                    const y = (v * canvas.offsetHeight) / 2;
+
+                    if (i === 0) {
+                        ctx.moveTo(x, y);
+                    } else {
+                        ctx.lineTo(x, y);
+                    }
+                    x += sliceWidth;
+                }
+
+                ctx.lineTo(canvas.offsetWidth, canvas.offsetHeight / 2);
+                ctx.stroke();
+            }
+            
+            draw();
+        }
+
+        function stopSession() {
+            updateStatus(false);
+            if (animationFrameId) {
+                cancelAnimationFrame(animationFrameId);
+                animationFrameId = null;
+            }
+            if (scriptProcessor) {
+                scriptProcessor.disconnect();
+                scriptProcessor.onaudioprocess = null;
+            }
+            if (mediaStreamSource) {
+                mediaStreamSource.disconnect();
+            }
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            nextPlaybackTime = 0;
+            
+            // Reset the canvas UI back to a flat baseline line
+            const canvas = document.getElementById("waveformCanvas");
+            if (canvas) {
+                const ctx = canvas.getContext("2d");
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+            }
+        }
+    </script>
+</body>
+</html>
